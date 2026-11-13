@@ -34,6 +34,7 @@ limits = ["Only the firmware is verified: no payload, DarwinBoot handoff or XNU 
 next_action = ["Retest the DEBUG build with the prebuilt disk drivers, then boot a payload through DarwinBoot once the kernel builds."]
 evidence = [
   { kind = "device", command = "./unixnu firmware --target RELEASE; ./unixnu bootimg --ramdisk ../uefi-apollo/Resources/ramdisk; fastboot boot", revision = "ab70992cdf353d7531df77649740bcce405365f4", reference = "https://github.com/Pistachio-Project/uefi-apollo/commit/ab70992cdf353d7531df77649740bcce405365f4", result = "Xiaomi Mi 10T M2007J3SY, LineageOS ABL: the UniXNU menu appears (no boot entries, no payload)." },
+  { kind = "device", command = "./unixnu build firmware --uefi ../uefi-apollo --target RELEASE; ./unixnu bootimg; fastboot boot", revision = "f072eb80b425299fa3ae306b1b706413a30dcc9c", reference = "https://github.com/Pistachio-Project/uefi-apollo/commit/f072eb80b425299fa3ae306b1b706413a30dcc9c", result = "Mi 10T: the RELEASE firmware with the Ramoops reservation and BootWatchdogDxe reaches the UniXNU menu, DarwinBoot hands off a 95 MB kernel collection from a 112 MiB payload, and a kernel that stops is reset without a key press." },
 ]
 
 [[area]]
@@ -176,6 +177,7 @@ limits = ["kernel.macho is an experimental prelink candidate with 5 missing and 
 next_action = ["Get past machine_lockdown (area arm64e-nopac), then build the userdata image from the two decrypted images and pin their volume UUIDs."]
 evidence = [
   { kind = "host", command = "./unixnu prelink -D ../UniXNU-apollo", revision = "7d85ede80092050f4d87f72ac7229bb605ce07fb", reference = "https://github.com/UniXNU/UniXNU/commit/7d85ede80092050f4d87f72ac7229bb605ce07fb", result = "CachyOS, /opt/unixnu-linux toolchain, kernelcache e6fa7559...: xnu-8796.121.2 builds and prelink emits kernel.macho sha256 545a58d6c39379daa36c4e4d66f4c2274c8a33bb4845ef09f4c6fc162c853ee3 with the Libm block catalogued (UniXNU-apollo commit carrying package/prelink)." },
+  { kind = "host", command = "scripts/apply-unixnu-patches.sh; scripts/build-kernel.sh; scripts/aea-decrypt.py out/ipsw/24A446/043-69370-711.dmg.aea", revision = "d3802fae034cb2c6ac2f4d7ddf48a440c089263c", reference = "https://github.com/Pistachio-Project/UniXNU-apollo/commit/d3802fae034cb2c6ac2f4d7ddf48a440c089263c", result = "CachyOS: the arm64e xnu-12377.121.6 kernel, the component archives and the LTO RELEASE reference build with upstream clang 24 and llvm-lto; merge_fileset_maps.py names 2755 kext-facing targets through the KDK kernel and adds 1041 functions through the RELEASE reference; both AEA images decrypt with every HMAC verified (SystemOS in 10 s, OS in 21 s)." },
 ]
 
 [[area]]
@@ -190,7 +192,10 @@ findings = ["PAC*, AUT* and XPAC* become NOP, the authenticated branches and loa
 completion = ["launchd and the daemons of the unchanged iOS 27 images run on the A77 with code signing enforced, with no instruction left that the CPU lacks outside the emulator's reach."]
 limits = ["The shared cache's executable mappings are not behind the pager yet, so no arm64e user process can run.", "The user-text pager and the emulator have not executed on the phone.", "Inline data inside kext text (Libm constant blocks) is rewritten like code if a word looks like a PAC instruction; none has been seen to matter."]
 next_action = ["Find the stop in machine_lockdown (stage marks inside arm_vm_prot_finalize; compare the memory window and the 4 KiB block split with UniXNU-sheng).", "Build the shared cache's code ranges when the cache is mapped and hook vm_shared_region_map_file."]
-evidence = []
+evidence = [
+  { kind = "host", command = "cd package/pacstrip && python3 -m unittest; scripts/build-kernel.sh", revision = "d3802fae034cb2c6ac2f4d7ddf48a440c089263c", reference = "https://github.com/Pistachio-Project/UniXNU-apollo/commit/d3802fae034cb2c6ac2f4d7ddf48a440c089263c", result = "CachyOS, /opt/unixnu-linux toolchain: 47 tests pass; the 24A446 collection (95,158,272 bytes) is emitted with 5 missing and 53 stubbed references and rewritten: 738,006 instructions, none left in executable segments, corecrypto kext HMAC stored again, source corecrypto sealed again." },
+  { kind = "device", command = "./unixnu payload --trust-cache out/ipsw/24A446/trustcache-iphone13.bundle; ./unixnu bootimg; scripts/bootcycle.sh fileset-6", revision = "d3802fae034cb2c6ac2f4d7ddf48a440c089263c", reference = "https://github.com/Pistachio-Project/UniXNU-apollo/commit/d3802fae034cb2c6ac2f4d7ddf48a440c089263c", result = "Xiaomi Mi 10T M2007J3SY, RELEASE firmware uefi-apollo f072eb8, fastboot boot from RAM: Darwin Kernel Version 25.5.0 DEVELOPMENT_ARM64_BCM2837 runs on the Cortex-A77 through VM bootstrap, zone_init, OSLog, corecrypto POST, PE_init_iokit, IONVRAM and early_boot; the last stage in the log is machine_lockdown at 0.225 s, no panic text, the phone resets and LineageOS returns 4716 bytes of console through pstore." },
+]
 
 [[area]]
 id = "diagnostics"
@@ -204,4 +209,6 @@ findings = ["HakiOS traced animation hitches of 65-235 ms to frames arriving lat
 completion = ["Each claimed milestone has a reproducible command, a matching source/image revision and an accessible result."]
 limits = ["The log needs the kernel to reach arm_vm_init's end; before that only the entry probe speaks."]
 next_action = ["Enable the firmware log exporter in uefi-apollo."]
-evidence = []
+evidence = [
+  { kind = "device", command = "scripts/bootcycle.sh", revision = "d3802fae034cb2c6ac2f4d7ddf48a440c089263c", reference = "https://github.com/Pistachio-Project/UniXNU-apollo/commit/d3802fae034cb2c6ac2f4d7ddf48a440c089263c", result = "Mi 10T, LineageOS: six consecutive cycles (adb reboot bootloader, fastboot boot of a 119 MB image, kernel run, self reset, console pulled from /sys/fs/pstore/console-ramoops-0) of about 45 s each without a key press; a panic text and the timed stage marks are readable in the pulled log." },
+]
