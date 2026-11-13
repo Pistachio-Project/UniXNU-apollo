@@ -1,0 +1,31 @@
+# Board patch paths for xnu-12377.121.6 (iOS 27.0.1), one per line in application order.
+#
+# sheng/: the device series of UniXNU-sheng (1108068, BSD-2-Clause-Patent), the reference iPadOS 27 port. Its
+# bring-up patch carries the 24A446 kernel changes UniXNU's prelink fixtures bind to (unixnu_kernel_stack_shift, ...),
+# so the 27 profile does not link without it; the board hooks in it are weak imports this board leaves undefined.
+sheng/zzye-sheng-cpu-idle.patch
+sheng/zzyf-sheng-amp.patch
+sheng/zzyd-sheng-audio-addon-mount.patch
+sheng/source-storage-runtime.patch
+sheng/zzzz-sheng-ipados27-bringup.patch
+sheng/vmwait-dyld-pager-source-release.patch
+sheng/zzzzzz-sheng-latency-trace.patch
+sheng/zzzzzzzz-sheng-exit-latency.patch
+sheng/zzzzzzzzz-sheng-unnest-trace.patch
+sheng/sheng-wifi-launchd-cache.patch
+sheng/sheng-bluetooth-runtime.patch
+sheng/sheng-wifi-association-event.patch
+sheng/sheng-main-thread-profile.patch
+sheng/sheng-cache-input-diagnostic.patch
+sheng/sheng-bluetooth-exit-diagnostic.patch
+sheng/zzzzzzzzzz-sheng-sigp-reinit-assert.patch
+sheng/sheng-appsync-runtime.patch
+sheng/sheng-appsync-user-trust.patch
+sheng/zzzzzzzzzzz-sheng-edge-matrix.patch
+# This repository:
+nopac-upstream-clang-ptrauth-null.patch
+nopac-native-keys.patch
+apollo-bootlog.patch
+nopac-emulate.patch
+nopac-user-text.patch
+apollo-board-hooks.patch

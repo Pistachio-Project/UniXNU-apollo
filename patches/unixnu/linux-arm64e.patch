@@ -1,0 +1,118 @@
+diff --git a/scripts/build-fileset-release-reference.py b/scripts/build-fileset-release-reference.py
+index 5090d11..f9323e8 100644
+--- a/scripts/build-fileset-release-reference.py
++++ b/scripts/build-fileset-release-reference.py
+@@ -7,6 +7,7 @@ import shutil
+ import hashlib
+ import argparse
+ import fnmatch
++import platform
+ from pathlib import Path
+ import subprocess
+ 
+@@ -65,6 +66,10 @@ def main():
+     final = build_root / 'mach.release.bcm2837.unstripped.noctf'
+     cache_record = final.with_suffix('.json')
+     sdk = root / '.cache/fakeroot'
++    if platform.system() == 'Linux':
++        # A changed patch series resets .cache/xnu-work, and the kernel script rewrites it for upstream clang only after
++        # the archives are built. This comparison kernel copies the tree now, so apply the (idempotent) rewrites first.
++        subprocess.run(['python3', str(root / 'scripts/linux/prepare-xnu.py'), 'source'], cwd=root, check=True)
+     archives = [root/'build/corecrypto-2023/libcorecrypto_kernel_noasm-namespaced.a']
+     forced = [root/f'build/{folder}/{name}' for folder,name in (
+         ('libpthread-kernel','libpthread_kernel.a'),('armdt-platform','libArmDTPlatform.a'),('armcpu','libArmCpu.a'))]
+@@ -123,6 +128,32 @@ def main():
+                                         *map(str,archives),*(f'-Wl,-force_load,{p}' for p in forced)]),
+         'XNU_EXTERNAL_KERNEL_ARCHIVES='+' '.join(map(str,archives+forced)),
+         f'OBJROOT={output}/{mode}-obj',f'SYMROOT={output}/{mode}-sym',f'DSTROOT={output}/{mode}-dst']
++    if platform.system() == 'Linux' and options.lto:
++        # cctools-port's ld64 has no libLTO, so it cannot do xnu's intermediate "ld -r" over the bitcode objects.
++        # llvm-lto of the same LLVM does that step in this private copy: one native object from all of them, every
++        # global kept, as a relocatable link keeps them.
++        lto = os.environ.get('UNIXNU_LLVM_LTO') or shutil.which('llvm-lto', path=str(Path(os.environ['CROSS_CLANG']).parent))
++        if not lto:
++            raise SystemExit('the LTO reference needs llvm-lto built from the LLVM of scripts/linux/setup-toolchain.py; '
++                             'set UNIXNU_LLVM_LTO')
++        makefile = source / 'makedefs/MakeInc.kernel'
++        text = makefile.read_text()
++        step = ('$(LD) $($(addsuffix $(CURRENT_ARCH_CONFIG),ARCH_FLAGS_)) -r nonlto.o -filelist ltolink.filelist '
++                '$(LDFLAGS_KERNEL_LTO) -Wl,-object_path_lto,$(TARGET)/justlto.o -o $(TARGET)/justlto.tmp.o && \\')
++        if step in text:
++            makefile.write_text(text.replace(step,
++                f'{lto} -O2 -inline-threshold=100 -enable-lto-internalization=false -relocation-model=static '
++                '-o $(TARGET)/justlto.o $$(cat ltolink.filelist) && \\'))
++        elif lto not in text:
++            raise SystemExit(f'{makefile}: the LTO link step is not the one this script replaces')
++    if platform.system() == 'Linux':
++        # What a Mac provides by itself (scripts/build-xnu-4k-baseline.sh passes the same to its own make).
++        clt = os.environ['CLT_PREFIX']
++        env.update(PLATFORM='iPhoneOS', HOST_CC=f'{clt}/bin/xnu-host-cc', MIGCOM=f'{clt}/libexec/migcom')
++        args += ['TIGHTBEAMC=tightbeamc-not-supported', 'BUILD_DSYM=0',
++                 f'MEMORY_SIZE={os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")}',
++                 f'SYSCTL_HW_PHYSICALCPU={os.cpu_count()}', f'SYSCTL_HW_LOGICALCPU={os.cpu_count()}',
++                 f'LD_KERNEL_LIBS={sdk}/usr/local/lib/kernel/libcc_kext.a']
+     (output/f'{mode}-command.json').write_text(json.dumps(args,indent=2)+'\n')
+     with (output/f'{mode}-build.log').open('w') as log:
+         result = subprocess.run(args,cwd=root,env=env,stdout=log,stderr=subprocess.STDOUT)
+diff --git a/scripts/linux/prepare-xnu.py b/scripts/linux/prepare-xnu.py
+index efef7a6..ccb4df2 100755
+--- a/scripts/linux/prepare-xnu.py
++++ b/scripts/linux/prepare-xnu.py
+@@ -8,6 +8,7 @@
+ 
+ Each rewrite checks whether it is still needed, so both modes can run on every build.
+ """
++import os
+ from pathlib import Path
+ import shutil
+ import subprocess
+@@ -109,7 +110,11 @@ def build_cc_kext():
+     # kernel headers (Kernel.framework); inttypes.h, stdio.h and gethostuuid.h come from Libc and Libsyscall, as they
+     # do from an SDK's usr/include.
+     out = FAKEROOT / 'usr/local/lib/kernel/libcc_kext.a'
+-    if out.is_file():
++    # The archive follows the kernel slice (arm64, or arm64e for the iOS 26 and 27 profiles): ld ignores a member of
++    # another slice and the link then misses the profile runtime.
++    arch, ios = os.environ.get('UNIXNU_XNU_ARCH', 'arm64'), os.environ.get('UNIXNU_IOS_VERSION', '17.0')
++    stamp = out.with_suffix('.target')
++    if out.is_file() and stamp.is_file() and stamp.read_text() == f'{arch} {ios}':
+         return
+     src = ROOT / '.cache/linux'
+     fetch(src / 'llvm-project', 'https://github.com/llvm/llvm-project', LLVM_COMMIT,
+@@ -120,13 +125,14 @@ def build_cc_kext():
+     objects.mkdir(parents=True, exist_ok=True)
+     out.parent.mkdir(parents=True, exist_ok=True)
+     for name in PROFILE_SOURCES:
+-        subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-arch', 'arm64', '-isysroot', FAKEROOT,
++        subprocess.run(['xcrun', 'clang', '-target', f'{arch}-apple-ios{ios}', '-arch', arch, '-isysroot', FAKEROOT,
+                         '-mkernel', '-DKERNEL_USE', '-O3', '-fPIC', '-w',
+                         '-I', rt / 'include', '-I', FAKEROOT / 'System/Library/Frameworks/Kernel.framework/Headers',
+                         '-idirafter', src / 'Libc/include', '-idirafter', XNU / 'libsyscall/wrappers',
+                         '-c', rt / f'lib/profile/{name}.c', '-o', objects / f'{name}.o'], check=True)
+     subprocess.run(['xcrun', 'libtool', '-static', '-o', out, *(objects / f'{n}.o' for n in PROFILE_SOURCES)],
+                    check=True)
++    stamp.write_text(f'{arch} {ios}')
+     info(f'libcc_kext.a: {out}')
+ 
+ 
+diff --git a/scripts/unixnu/kernel.py b/scripts/unixnu/kernel.py
+index 9924ddb..bed7794 100644
+--- a/scripts/unixnu/kernel.py
++++ b/scripts/unixnu/kernel.py
+@@ -191,6 +191,16 @@ def build(ctx, modules):
+         tool('xcodebuild', 'the kernel step builds with the Xcode iphoneos SDK')
+     env.update(xnu_env(ctx))
+     env.update(version_env(modules, ctx))
++    if platform.system() == 'Linux':
++        # The cross compiler and the SDK shims follow the selected architecture and OS profiles. An arm64e kernel also
++        # takes the function pointer type discrimination Apple clang turns on for -mkernel (scripts/linux/clang).
++        arch, ios = env.get('UNIXNU_XNU_ARCH', 'arm64'), env.get('UNIXNU_IOS_VERSION', '17.0')
++        env['DARWIN_TRIPLE'], env['UNIXNU_SDK_VERSION'] = f'{arch}-apple-ios{ios}', ios
++        if arch == 'arm64e':
++            # ... and the __ARM_ARCH_8_x__ macros Apple clang predefines for the arm64e default CPU (apple-a12, ARMv8.3),
++            # which xnu selects its LSE atomics, PAN/UAO and RCPC paths by.
++            env['CROSS_EXTRA_FLAGS'] = ('-fptrauth-function-pointer-type-discrimination -D__ARM_ARCH_8_2__=1 '
++                                        '-D__ARM_ARCH_8_3__=1 ' + env['CROSS_EXTRA_FLAGS'])
+     if ctx.schema_version == 2:
+         env['UNIXNU_PATCH_LIST'] = str(patches.prepare(ctx, modules))
+         generated = ctx.tree / 'build/generated'

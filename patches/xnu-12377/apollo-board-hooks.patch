@@ -1,0 +1,44 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 3b2306d..aba7c4c 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -413,6 +413,7 @@ bsd/kern/kern_fork.c			standard
+ bsd/kern/kern_malloc.c			standard
+ bsd/kern/kern_mman.c			standard
+ bsd/kern/kern_nopac.c			standard
++bsd/kern/apollo_board.c			standard
+ bsd/kern/kern_persona.c			standard
+ bsd/kern/kern_physio.c			standard
+ bsd/kern/kern_priv.c			standard
+diff --git a/bsd/kern/apollo_board.c b/bsd/kern/apollo_board.c
+new file mode 100644
+index 0000000..fcdb328
+--- /dev/null
++++ b/bsd/kern/apollo_board.c
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: BSD-2-Clause-Patent
++/*
++ * Board hooks of the iPadOS 27 bring-up series (UniXNU-sheng) that apollo has
++ * no implementation for yet. The series declares them weak, but an arm64e link
++ * cannot leave the authenticated pointer of an undefined weak symbol
++ * unresolved, so they are defined here as the absent case. They move to the
++ * board's storage archive when apollo has one (porting.toml, area "storage").
++ */
++#include <stdint.h>
++#include <sys/types.h>
++
++void native_source_storage_start(void);
++void boot_cache_input_capture(user_addr_t address, uint64_t length);
++
++/* Rounds the board's log writer has completed; bsd_init waits for the first with log=1. Nothing writes one here. */
++volatile uint32_t boot_log_rounds = 1;
++
++void
++native_source_storage_start(void)
++{
++}
++
++void
++boot_cache_input_capture(__unused user_addr_t address, __unused uint64_t length)
++{
++}

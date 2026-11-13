@@ -3,16 +3,4 @@
 name = "sm8250"
 kind = "soc"
 git = "https://github.com/Pistachio-Project/UniXNU-sm8250-common"
-commit = "13f1d8739a742ebe93e7847b8547ab99bcde5b34"
-
-# The iOS 16.5 kernel source (OS profile os-profiles/ios-16.5-20F66).
-[[source]]
-name = "xnu"
-kind = "refer"
-git = "https://github.com/apple-oss-distributions/xnu.git"
-ref = "xnu-8796.121.2"
-commit = "c54f35ca767986246321eb901baf8f5ff7923f6a"
-darwin = "22.5.0"
-version = "8796.121.2"
-driverkit_tag = "xnu-8796.121.2"
-trustcache_tag = "xnu-8796.101.5"
+commit = "1f4c73454d989c113cb4c964b9091884299b8125"

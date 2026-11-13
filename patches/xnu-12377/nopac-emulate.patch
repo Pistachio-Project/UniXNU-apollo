@@ -1,0 +1,425 @@
+diff --git a/osfmk/arm64/nopac_emulate.c b/osfmk/arm64/nopac_emulate.c
+new file mode 100644
+index 0000000..c7114da
+--- /dev/null
++++ b/osfmk/arm64/nopac_emulate.c
+@@ -0,0 +1,305 @@
++// SPDX-License-Identifier: BSD-2-Clause-Patent
++/*
++ * See nopac_emulate.h. The decoding core is free of kernel types, so the
++ * host test of the device repository (package/pacstrip/test_emulate.c)
++ * compiles this file as it is.
++ *
++ * The FJCVTZS conversion follows darwin-lisa's pac_emulate.c
++ * (https://github.com/mateusseiboth/darwin-lisa, MIT, Copyright (c) 2026
++ * Mateus Seiboth): the IEEE-754 double is decoded by its integer fields, so
++ * no floating point is used in the kernel.
++ */
++#include <arm64/nopac_emulate.h>
++
++#define NZCV_N (1u << 31)
++#define NZCV_Z (1u << 30)
++#define NZCV_C (1u << 29)
++#define NZCV_V (1u << 28)
++
++static inline unsigned
++field(uint32_t word, unsigned low, unsigned bits)
++{
++	return (word >> low) & ((1u << bits) - 1);
++}
++
++static inline uint64_t
++reg_or_zero(const struct nopac_context *context, unsigned index)
++{
++	return index == 31 ? 0 : context->x[index];
++}
++
++static inline void
++set_reg(struct nopac_context *context, unsigned index, uint64_t value)
++{
++	if (index != 31) {
++		context->x[index] = value;
++	}
++}
++
++static enum nopac_result
++done(struct nopac_context *context)
++{
++	context->pc += 4;
++	return NOPAC_DONE;
++}
++
++/* PAC*, AUT*, XPAC* with register operands (data-processing, one source). */
++static bool
++is_pac_data_processing(uint32_t word)
++{
++	unsigned opcode = field(word, 10, 6);
++
++	if ((word & 0xFFFF0000u) != 0xDAC10000u || opcode > 0x11) {
++		return false;
++	}
++	/* PACIZA and later take no modifier: Rn must be 31. */
++	return opcode < 0x08 || field(word, 5, 5) == 31;
++}
++
++static enum nopac_result
++emulate_load(uint32_t word, struct nopac_context *context)
++{
++	unsigned rt = field(word, 0, 5), rn = field(word, 5, 5);
++	bool writeback = field(word, 11, 1);
++	int32_t raw = (int32_t)(field(word, 22, 1) << 9 | field(word, 12, 9));
++	int64_t offset = (int64_t)((raw & 0x200) ? raw - 0x400 : raw) * 8;
++	uint64_t address = (rn == 31 ? context->sp : context->x[rn]) + (uint64_t)offset;
++	uint64_t value;
++
++	if (context->load64(context->cookie, address, &value) != 0) {
++		return NOPAC_FAULT;
++	}
++	set_reg(context, rt, value);
++	if (writeback) {
++		if (rn == 31) {
++			context->sp = address;
++		} else {
++			context->x[rn] = address;
++		}
++	}
++	return done(context);
++}
++
++static enum nopac_result
++emulate_fjcvtzs(uint32_t word, struct nopac_context *context)
++{
++	uint64_t bits = context->d[field(word, 5, 5)];
++	uint64_t sign = bits >> 63, mantissa = bits & 0xFFFFFFFFFFFFFull;
++	uint32_t exponent = (uint32_t)(bits >> 52) & 0x7FF;
++	uint32_t result = 0;
++	bool exact = false;
++
++	if (!context->has_fp) {
++		return NOPAC_UNHANDLED;
++	}
++	if (exponent == 0x7FF) {
++		/* NaN or infinity: 0, inexact */
++	} else if (exponent == 0 && mantissa == 0) {
++		exact = sign == 0;
++	} else {
++		uint64_t significand = exponent == 0 ? mantissa : (1ull << 52) | mantissa;
++		int scale = exponent == 0 ? -1074 : (int)exponent - 1023 - 52;      /* value = significand * 2^scale */
++		uint64_t magnitude;
++		bool fraction = false, in_range = false;
++
++		if (scale >= 0) {
++			magnitude = scale >= 64 ? 0 : significand << scale;
++		} else if (-scale >= 64) {
++			magnitude = 0;
++			fraction = true;
++		} else {
++			magnitude = significand >> -scale;
++			fraction = (significand & ((1ull << -scale) - 1)) != 0;
++			in_range = magnitude <= (sign ? 0x80000000ull : 0x7FFFFFFFull);
++		}
++		result = sign ? (uint32_t)(0 - (uint32_t)magnitude) : (uint32_t)magnitude;
++		exact = !fraction && in_range;
++	}
++	set_reg(context, field(word, 0, 5), result);
++	context->nzcv = exact ? NZCV_Z : 0;
++	return done(context);
++}
++
++/* RMIF Xn, #shift, #mask: the selected flags come from Xn rotated right by shift. */
++static enum nopac_result
++emulate_rmif(uint32_t word, struct nopac_context *context)
++{
++	uint64_t value = reg_or_zero(context, field(word, 5, 5));
++	unsigned shift = field(word, 15, 6), mask = field(word, 0, 4);
++	uint32_t rotated = (uint32_t)((shift ? (value >> shift) | (value << (64 - shift)) : value) & 0xF);
++
++	context->nzcv = (context->nzcv & ~(mask << 28)) | ((rotated & mask) << 28);
++	return done(context);
++}
++
++/* SETF8 / SETF16: N and Z from the low 8 or 16 bits, V from bit 8 or 16 against the sign; C kept. */
++static enum nopac_result
++emulate_setf(uint32_t word, struct nopac_context *context)
++{
++	uint32_t value = (uint32_t)reg_or_zero(context, field(word, 5, 5));
++	unsigned msb = field(word, 14, 1) ? 15 : 7;
++	uint32_t flags = context->nzcv & NZCV_C;
++
++	if (value >> msb & 1) {
++		flags |= NZCV_N;
++	}
++	if ((value & ((2u << msb) - 1)) == 0) {
++		flags |= NZCV_Z;
++	}
++	if ((value >> (msb + 1) & 1) != (value >> msb & 1)) {
++		flags |= NZCV_V;
++	}
++	context->nzcv = flags;
++	return done(context);
++}
++
++enum nopac_result
++nopac_emulate_instruction(uint32_t word, struct nopac_context *context)
++{
++	uint64_t target;
++
++	if (is_pac_data_processing(word)) {
++		return done(context);
++	}
++	if ((word & 0xFFE0FC00u) == 0x9AC03000u) {              /* PACGA: as the rewrite, EOR Xd, Xn, Xm, ROR #13 */
++		uint64_t m = reg_or_zero(context, field(word, 16, 5));
++		set_reg(context, field(word, 0, 5), reg_or_zero(context, field(word, 5, 5)) ^ (m >> 13 | m << 51));
++		return done(context);
++	}
++	if ((word & 0xFFFFFBFFu) == 0xD65F0BFFu) {              /* RETAA, RETAB */
++		context->pc = context->x[30];
++		return NOPAC_DONE;
++	}
++	if ((word & 0xFFFFF800u) == 0xD71F0800u ||              /* BRAA, BRAB */
++	    (word & 0xFFFFF81Fu) == 0xD61F081Fu) {              /* BRAAZ, BRABZ */
++		context->pc = reg_or_zero(context, field(word, 5, 5));
++		return NOPAC_DONE;
++	}
++	if ((word & 0xFFFFF800u) == 0xD73F0800u ||              /* BLRAA, BLRAB */
++	    (word & 0xFFFFF81Fu) == 0xD63F081Fu) {              /* BLRAAZ, BLRABZ */
++		target = reg_or_zero(context, field(word, 5, 5));
++		context->x[30] = context->pc + 4;
++		context->pc = target;
++		return NOPAC_DONE;
++	}
++	if ((word & 0xFF200400u) == 0xF8200400u) {              /* LDRAA, LDRAB */
++		return emulate_load(word, context);
++	}
++	if ((word & 0xFFFFFC00u) == 0x1E7E0000u) {              /* FJCVTZS */
++		return emulate_fjcvtzs(word, context);
++	}
++	if ((word & 0xFFFFF0FFu) == 0xD503405Fu ||              /* MSR DIT, #imm */
++	    (word & 0xFFFFFFE0u) == 0xD51B42A0u ||              /* MSR DIT, Xt */
++	    word == 0xD50330FFu) {                              /* SB */
++		return done(context);
++	}
++	if ((word & 0xFFFFFFE0u) == 0xD53B42A0u) {              /* MRS Xt, DIT: no data independent timing */
++		set_reg(context, field(word, 0, 5), 0);
++		return done(context);
++	}
++	if (word == 0xD500401Fu) {                              /* CFINV */
++		context->nzcv ^= NZCV_C;
++		return done(context);
++	}
++	if (word == 0xD500405Fu) {                              /* AXFLAG */
++		bool z = (context->nzcv & (NZCV_Z | NZCV_V)) != 0, c = (context->nzcv & NZCV_C) && !(context->nzcv & NZCV_V);
++		context->nzcv = (z ? NZCV_Z : 0) | (c ? NZCV_C : 0);
++		return done(context);
++	}
++	if (word == 0xD500403Fu) {                              /* XAFLAG */
++		bool z = context->nzcv & NZCV_Z, c = context->nzcv & NZCV_C;
++		context->nzcv = (!c && !z ? NZCV_N : 0) | (z && c ? NZCV_Z : 0) | (c || z ? NZCV_C : 0) | (!c && z ? NZCV_V : 0);
++		return done(context);
++	}
++	if ((word & 0xFFE07C10u) == 0xBA000400u) {              /* RMIF */
++		return emulate_rmif(word, context);
++	}
++	if ((word & 0xFFFFBC1Fu) == 0x3A00080Du) {              /* SETF8, SETF16 */
++		return emulate_setf(word, context);
++	}
++	return NOPAC_UNHANDLED;
++}
++
++#if defined(KERNEL) && !defined(NOPAC_HOST_TEST)
++
++#include <arm64/proc_reg.h>
++#include <kern/thread.h>
++#include <libkern/OSAtomic.h>
++#include <vm/vm_map_xnu.h>      /* copyin() */
++
++/* Instructions emulated since boot, for diagnostics (sysctl-free: read with a debugger or the boot log). */
++uint64_t nopac_emulated_user;
++uint64_t nopac_emulated_kernel;
++
++static int
++nopac_load_user(void *cookie __unused, uint64_t address, uint64_t *value)
++{
++	return copyin((user_addr_t)address, value, sizeof(*value)) == 0 ? 0 : -1;
++}
++
++static int
++nopac_load_kernel(void *cookie __unused, uint64_t address, uint64_t *value)
++{
++	/* A bad kernel pointer faults here as it would have at the load itself. */
++	*value = *(const uint64_t *)address;
++	return 0;
++}
++
++bool
++nopac_emulate_trap(arm_saved_state_t *state, uint32_t instruction)
++{
++	struct nopac_context context = {};
++	bool kernel;
++
++	if (!is_saved_state64(state)) {
++		return false;
++	}
++	kernel = PSR64_IS_KERNEL(get_saved_state_cpsr(state));
++	for (unsigned i = 0; i < 29; i++) {
++		context.x[i] = get_saved_state_reg(state, i);
++	}
++	context.x[29] = get_saved_state_fp(state);
++	context.x[30] = get_saved_state_lr(state);
++	context.sp = get_saved_state_sp(state);
++	context.pc = get_saved_state_pc(state);
++	context.nzcv = get_saved_state_cpsr(state) & PSR64_NZCV_MASK;
++	context.load64 = kernel ? nopac_load_kernel : nopac_load_user;
++	if (!kernel) {
++		/* An EL0 synchronous exception has spilled the NEON registers to the thread before C code runs. */
++		arm_neon_saved_state_t *neon = current_thread()->machine.uNeon;
++		if (neon != NULL) {
++			const arm_neon_saved_state64_t *registers = neon_state64(neon);
++			for (unsigned i = 0; i < 32; i++) {
++				context.d[i] = registers->v.d[i][0];
++			}
++			context.has_fp = true;
++		}
++	}
++
++	struct nopac_context before = context;
++	if (nopac_emulate_instruction(instruction, &context) != NOPAC_DONE) {
++		return false;
++	}
++	for (unsigned i = 0; i < 29; i++) {
++		if (context.x[i] != before.x[i]) {
++			set_saved_state_reg(state, i, context.x[i]);
++		}
++	}
++	if (context.x[29] != before.x[29]) {
++		set_saved_state_fp(state, context.x[29]);
++	}
++	if (context.x[30] != before.x[30]) {
++		set_saved_state_lr(state, context.x[30]);
++	}
++	if (context.sp != before.sp) {
++		set_saved_state_sp(state, context.sp);
++	}
++	if (context.nzcv != before.nzcv) {
++		set_saved_state_cpsr(state, (get_saved_state_cpsr(state) & ~PSR64_NZCV_MASK) | (context.nzcv & PSR64_NZCV_MASK));
++	}
++	set_saved_state_pc(state, context.pc);
++	OSIncrementAtomic64((SInt64 *)(kernel ? &nopac_emulated_kernel : &nopac_emulated_user));
++	return true;
++}
++
++#endif /* KERNEL && !NOPAC_HOST_TEST */
+diff --git a/osfmk/arm64/nopac_emulate.h b/osfmk/arm64/nopac_emulate.h
+new file mode 100644
+index 0000000..c1c47bf
+--- /dev/null
++++ b/osfmk/arm64/nopac_emulate.h
+@@ -0,0 +1,49 @@
++// SPDX-License-Identifier: BSD-2-Clause-Patent
++/*
++ * Emulation of the instructions an arm64e image executes that an ARMv8.2 CPU
++ * without pointer authentication does not have.
++ *
++ * The kernel image is rewritten after the link and user code pages are
++ * rewritten as they are paged in (PAC*, AUT*, XPAC* to NOP, authenticated
++ * branches and loads to their plain forms). What reaches the CPU unrewritten
++ * traps as an undefined instruction and is emulated here: code generated at
++ * run time (a JIT), pages the pager left alone, and the forms that have no
++ * 4-byte replacement (LDRAA/LDRAB with an offset outside the LDR/LDUR range,
++ * FJCVTZS).
++ *
++ * No pointer is ever signed on this CPU, so signing, authenticating and
++ * stripping are the identity, exactly as the rewrite makes them.
++ */
++#ifndef _ARM64_NOPAC_EMULATE_H_
++#define _ARM64_NOPAC_EMULATE_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++
++enum nopac_result {
++	NOPAC_UNHANDLED = 0,    /* not an instruction emulated here */
++	NOPAC_DONE = 1,         /* emulated; the context is updated and pc advanced */
++	NOPAC_FAULT = 2,        /* the memory access of the instruction failed */
++};
++
++struct nopac_context {
++	uint64_t x[31];         /* X0..X30 */
++	uint64_t sp;
++	uint64_t pc;            /* address of the instruction */
++	uint64_t d[32];         /* low 64 bits of V0..V31 (FJCVTZS source) */
++	uint32_t nzcv;          /* PSTATE.NZCV in bits 31..28 */
++	bool     has_fp;        /* d[] is valid */
++	/* Reads 8 bytes; returns 0 on success. */
++	int    (*load64)(void *cookie, uint64_t address, uint64_t *value);
++	void    *cookie;
++};
++
++enum nopac_result nopac_emulate_instruction(uint32_t instruction, struct nopac_context *context);
++
++#if defined(KERNEL) && !defined(NOPAC_HOST_TEST)
++#include <mach/arm/thread_status.h>
++/* For handle_uncategorized(): true when the trapped instruction was emulated. */
++bool nopac_emulate_trap(arm_saved_state_t *state, uint32_t instruction);
++#endif
++
++#endif /* _ARM64_NOPAC_EMULATE_H_ */
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index b3df189..d5bcc90 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1,5 +1,6 @@
+ #include <kern/boot_progress.h>
+ #include <arm64/bootlog.h>
++#include <arm64/nopac_emulate.h>
+ /*
+  * Copyright (c) 2012-2023 Apple Inc. All rights reserved.
+  *
+@@ -1238,6 +1239,16 @@ handle_uncategorized(arm_saved_state_t *state)
+ 
+ #endif /* CONFIG_DTRACE */
+ 
++#if NATIVE_PAC_STRIPPED
++	/*
++	 * No pointer authentication on this CPU: an arm64e instruction that the
++	 * rewrite of the kernel image or of a user code page left in place.
++	 */
++	if (nopac_emulate_trap(state, instr)) {
++		return;
++	}
++#endif /* NATIVE_PAC_STRIPPED */
++
+ 	if (PSR64_IS_KERNEL(get_saved_state_cpsr(state))) {
+ 		if (IS_ARM_GDB_TRAP(instr)) {
+ 			boolean_t interrupt_state;
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index cce9ab2..9259fea 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -7,6 +7,7 @@ osfmk/vm/vm_apple_protect.c	 standard
+ 
+ osfmk/arm64/hi_res_clock_map.c 	optional hi_res_clock
+ osfmk/arm64/bootlog.c			standard
++osfmk/arm64/nopac_emulate.c		standard
+ 
+ osfmk/arm/pmap/pmap.c			optional nos_arm_pmap
+ osfmk/arm/pmap/pmap_cs.c		optional nos_arm_pmap
+diff --git a/osfmk/mach/arm/thread_status.h b/osfmk/mach/arm/thread_status.h
+index 99971b0..524691f 100644
+--- a/osfmk/mach/arm/thread_status.h
++++ b/osfmk/mach/arm/thread_status.h
+@@ -331,6 +331,14 @@ typedef _STRUCT_ARM_LEGACY_DEBUG_STATE arm_debug_state_t;
+ #define HAS_MASK_SAVED_STATE_CPSR       1
+ #endif /* CONFIG_DTRACE */
+ 
++#if defined(ARM64_BOARD_CONFIG_BCM2837) && defined(__arm64e__)
++/* arm64/nopac_emulate.c writes the state of the instruction it emulated, in every kernel configuration. */
++#define HAS_SET_SAVED_STATE_PC          1
++#define HAS_SET_SAVED_STATE_LR          1
++#define HAS_SET_SAVED_STATE_REG         1
++#define HAS_SET_SAVED_STATE_CPSR        1
++#endif
++
+ #if CONFIG_KDP_INTERACTIVE_DEBUGGING
+ #define HAS_SET_SAVED_STATE_CPSR        1
+ #endif /* CONFIG_KDP_INTERACTIVE_DEBUGGING */

@@ -12,6 +12,20 @@ Licenses, by directory:
 - package/ (except package/prelink/) and scripts/ other than the files named above: from HakiOS, MIT License,
   "Copyright (c) 2025-2026 the HakiOS authors", see package/LICENSE.MIT.
 
+- package/pacstrip/ (insn.py, macho.py, pacstrip.py, dyldcache.py, featscan.py, vectors.py and their tests) and
+  osfmk/arm64/nopac_rewrite.[ch] inside patches/xnu-12377/nopac-user-text.patch: from darwin-lisa
+  (https://github.com/mateusseiboth/darwin-lisa, tools/pacstrip and kernel/pacstrip), MIT License,
+  "Copyright (c) 2026 Mateus Seiboth"; changed here (kernel sections, kernel collections). The FJCVTZS conversion of
+  osfmk/arm64/nopac_emulate.c follows its kernel/pacstrip/pac_emulate.c. cachemap.py, test_emulate.*,
+  test_rewrite.py and test_kernel_sections.py are this repository's (BSD-2-Clause-Patent).
+- package/aea/libzbitmap.[ch]: libzbitmap by Ernesto A. Fernandez, "Copyright (c) 2022 Corellium LLC",
+  GPL-2.0+ OR MIT, taken under MIT (through darwin-lisa). package/aea/aea-decrypt.c is this repository's
+  (BSD-2-Clause-Patent); its container layout follows blacktop/ipsw's pkg/aea (MIT).
+- patches/xnu-12377/sheng/: the device patch series of UniXNU-sheng (https://github.com/UniXNU/UniXNU-sheng,
+  1108068), BSD-2-Clause-Patent, "Copyright (c) 2026, UniXNU contributors"; a derivative work of Apple's XNU
+  like every file under patches/xnu-12377 (APSL 2.0 for Apple's portions, patches/xnu/LICENSE.APSL).
+- patches/unixnu/: changes to UniXNU's own scripts (BSD-2-Clause-Patent, UniXNU contributors).
+
 Bluetooth inputs (wiring, firmware files, UART rates, iOS 16 bluetoothd behaviour) come from
 aTechGeekDev/ios-apollo (https://github.com/aTechGeekDev/ios-apollo), MIT License,
 "Copyright (c) 2026 Leo Malik, Copyright (c) 2026 dipa-studio", used with the author's permission.

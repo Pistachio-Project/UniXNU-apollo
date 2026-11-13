@@ -4,30 +4,29 @@ schema_version = 2
 name = "apollo"
 soc = "SM8250"
 soc_source = "sm8250"
-os_profile = "ios-16.5-20F66"
+os_profile = "ios-27.0.1-24A446"
 description = "Xiaomi Mi 10T / Mi 10T Pro / Redmi K30S Ultra (apollo), SM8250"
 kit = "apollo"
 
 [components]
-include = ["ArmDTPlatform", "ArmCpu", "SoftwareAES", "XnuPrelink", "DarwinBoot", "GopFramebuffer", "RamBlock", "AppleKeyStoreState"]
+include = ["ArmDTPlatform", "ArmCpu", "XnuPrelink", "DarwinBoot", "GopFramebuffer", "RamBlock", "AppleKeyStoreState"]
 
 [kernel]
 defconfig = "apollo_defconfig"
 config_fragments = ["arch:configs/common.config", "soc:configs/sm8250.config", "os:configs/ios.config"]
-# The ARM64 series targets xnu-10063; the iOS 16.5 OS series carries its xnu-8796 equivalent.
-patch_series = ["soc:patches/xnu/series", "os:patches/xnu/series", "device:patches/xnu/series"]
-# The ARM64 profile's archive plan plus the board's kernel-stage components (arrays replace the inherited one).
+# iOS 27.0.1 is arm64e only and the SM8250's Cortex-A77/A55 have no pointer authentication. The kernel is built as
+# arm64e exactly as on a PAC SoC (same prelink against the 24A446 kernelcache), and device:patches/xnu-12377 plus the
+# pacstrip pass of package/pacstrip make it run without PAC (porting.toml, area "arm64e-nopac").
+patch_series = ["arch:patches/xnu/series", "soc:patches/xnu-12377/series", "os:patches/xnu/series", "device:patches/xnu-12377/series"]
 archives = [
   "build-corecrypto-14.py",
   "build-corecrypto-14.py --namespace",
   "component:ArmDTPlatform",
   "component:ArmCpu",
-  "component:SoftwareAES",
-  "build-software-aes-bindings.py",
-  "build-mockfs-fixture.py",
   "build-libpthread-kernel.py",
   "component:RamBlock",
   "component:AppleKeyStoreState",
+#REF  "build-fileset-release-reference.py --tree . --lto",   # naming aid only; rebuilt on request (scripts/build-kernel.sh)
 ]
 
 [device_tree]
@@ -72,22 +71,26 @@ kernel_compression = "gzip"
 
 [payload]
 volume = "APOLLO"
-# 64 MiB: the kernel (55.6 MB), trust cache and ADT fit; apollo's ABL stalled receiving a 194 MiB
-# boot image over fastboot (2026-11-13). Raise it when a Data seed joins the payload.
-size_mib = 64
+# 112 MiB: the iOS 27 kernel collection is 95 MB. apollo's ABL stalled receiving a 194 MiB boot image over fastboot
+# (2026-11-13), so a Data seed cannot simply join the payload.
+size_mib = 112
 loader = "firmware"
-title = "iOS 16.5"
+title = "iOS 27.0.1"
 dram_size = "0x200000000"
 timeout = 3
 # HakiOS's driver arguments (apollo_touch=1 apollo_buttons=1 apollo_battery=1 apollo_cpufreq=1
 # apollo_audio=5 apollo_mic=4 apollo_gpu=21 apollo_display=1 apollo_haptic=5 apollo_wifi=5 ...)
 # join this list when patches/xnu/0001-0002 are applied.
-kernel_args = ["-v"]
-# Entry probe (docs guide/debugging#green-bar), apollo 2026-11-13: resets seen after MMU enable, arm_vm_init,
-# serial_init, kernel_startup_initialize_upto, (with CONFIG_XNU_DT_PANIC_REGION) PE_create_console, PE_init_printf, ml_map_cpu_pio and fiq_context_init (all of arm_init), vm_mem_bootstrap, machine_init, exception_init (all of kernel_bootstrap), PE_init_iokit, vm_commpage_init (after the console is acquired).
-entry_probe_reset_delay = 6
-entry_probe_reset_after = "_bsd_init"
-entry_probe_reset_in = "_kernel_bootstrap_thread"
+kernel_args = ["-v", "debug=0x14e", "bootlog=0xb0000000", "bootlog-size=0x200000", "bootlog-reset=40", "bootlog-wdt=0x17c10000"]
+# bootlog (patches/xnu-12377/apollo-bootlog.patch): the console and kprintf go to Android's ramoops console zone and the
+# kernel resets after bootlog-reset seconds; LineageOS then shows the text in /sys/fs/pstore/console-ramoops-0.
+# The firmware reserves the zone (uefi-apollo MemoryMapLib, "Ramoops") and arms the APSS watchdog for 30 s when it
+# hands off (BootWatchdogDxe); bootlog-wdt lets the kernel feed it, so only a hung kernel is reset by it.
+trust_cache_sha256 = ["16f4dc2548316302b84bab6e9e55027e48dd597737a57fd83c5d5bfc2cdd2711"]
+# Entry probe (docs guide/debugging#green-bar): blue and magenta bars below DarwinBoot's green one, the panic text
+# on the frame buffer, and a reset entry_probe_reset_delay seconds after the MMU is on.
+# panic_screen = true   # does not fit: the screen code is 0xa27 bytes and the padding after the entry of the Linux-built kernel ends 0x57 bytes short
+# entry_probe_reset_delay = 6
 
 [payload.adt]
 # Qualcomm SoC ID of SM8250 (356), read from /sys/devices/soc0/soc_id on the phone (revision 2.1).
@@ -102,6 +105,19 @@ artwork-display-gamut = "sRGB"
 [adt.product.u32]
 oled-display = 0
 
+# What UniXNU-sheng, the reference iPadOS 27 board, tells XNU about a board without Apple's SoC services.
+[adt.defaults.u32]
+sleep-disabled = 1
+# No Apple PMGR or SEP: report a virtual platform, so AMFI does not wait for an ApplePMGRNub.
+vmm-present = 1
+# The kernel is built with CONFIG_VNODES=1024 (xsmall); XNU reads this value before it clips desiredvnodes.
+"kern.maxvnodes" = 78848
+
+[adt.chosen.u32]
+# This SoC has no CTRR: kernel text stays writable by hardware, which XNU must be told (iBoot writes this on Apple
+# SoCs). Without it the iOS 27 kernel stopped in machine_lockdown on apollo (boot log 2026-11-13, fileset-5).
+kernel-ctrr-to-be-enabled = 0
+
 # The Darwin partition HakiOS carved after userdata (scripts/gpt-carve-darwin.py): LUN 0
 # entry 35, GPT name "darwin", 20 GiB. Measured 2026-11-12 from /sys/class/block/sda35
 # (start 205535232, size 41945048 in 512-byte units). UniXNU's own procedure names this
@@ -115,4 +131,4 @@ lba_bytes = 4096
 unixnu = "../UniXNU"
 
 [package.defconfig]
-"ios-16.5-20F66" = "apollo_defconfig"
+"ios-27.0.1-24A446" = "apollo_defconfig"

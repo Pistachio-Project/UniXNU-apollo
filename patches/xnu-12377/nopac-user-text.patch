@@ -1,0 +1,669 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 60d8aa6..3b2306d 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -412,6 +412,7 @@ bsd/kern/kern_lockf.c			standard
+ bsd/kern/kern_fork.c			standard
+ bsd/kern/kern_malloc.c			standard
+ bsd/kern/kern_mman.c			standard
++bsd/kern/kern_nopac.c			standard
+ bsd/kern/kern_persona.c			standard
+ bsd/kern/kern_physio.c			standard
+ bsd/kern/kern_priv.c			standard
+diff --git a/bsd/kern/kern_mman.c b/bsd/kern/kern_mman.c
+index d3d9993..fe3931d 100644
+--- a/bsd/kern/kern_mman.c
++++ b/bsd/kern/kern_mman.c
+@@ -135,6 +135,7 @@
+ #include <security/mac_framework.h>
+ #endif
+ #include <os/overflow.h>
++#include <kern/kern_nopac.h>
+ 
+ /*
+  * this function implements the same logic as dyld's "dyld_fall_2020_os_versions"
+@@ -914,6 +915,14 @@ map_file_retry:
+ 			user_addr = vm_map_page_size(user_map);
+ 			goto map_file_retry;
+ 		}
++		if (result == KERN_SUCCESS && (prot & VM_PROT_EXECUTE) && !(flags & MAP_SHARED) && vnode_isreg(vp)) {
++			/*
++			 * No pointer authentication on this CPU: an image dyld maps from a file
++			 * (outside the shared cache) has its code rewritten as it is paged in.
++			 */
++			nopac_protect_text(user_map, user_addr, user_addr + user_size, vp, -1,
++			    (off_t)vm_map_trunc_page(file_pos, user_mask));
++		}
+ 	}
+ 
+ 	if (!mapanon) {
+diff --git a/bsd/kern/kern_nopac.c b/bsd/kern/kern_nopac.c
+new file mode 100644
+index 0000000..eb65448
+--- /dev/null
++++ b/bsd/kern/kern_nopac.c
+@@ -0,0 +1,414 @@
++// SPDX-License-Identifier: BSD-2-Clause-Patent
++/*
++ * See kern_nopac.h.
++ */
++#include <kern/kern_nopac.h>
++
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/page_decrypt.h>
++#include <libkern/OSAtomic.h>
++#include <libkern/OSByteOrder.h>
++#include <mach/machine.h>
++#include <mach-o/fat.h>
++#include <mach-o/loader.h>
++#include <pexpert/pexpert.h>
++#include <sys/param.h>
++#include <sys/kauth.h>
++#include <sys/mman.h>
++#include <sys/proc.h>
++#include <sys/queue.h>
++#include <sys/systm.h>
++#include <sys/vnode.h>
++#include <vm/vm_map_xnu.h>
++#include <vm/vm_protos.h>
++
++#if NATIVE_PAC_STRIPPED && CONFIG_CODE_DECRYPTION
++
++extern size_t nopac_rewrite_words(uint32_t *words, size_t count);
++
++#define NOPAC_COMMANDS_MAX      (1024 * 1024)   /* load commands of one image */
++#define NOPAC_CHUNK             4096            /* the pager transforms 4 KiB at a time */
++#define NOPAC_HASH_BUCKETS      256
++
++struct nopac_range {
++	uint64_t start;         /* file offsets */
++	uint64_t end;
++};
++
++/*
++ * The code sections of one Mach-O, by the identity of its file. The address
++ * of the record is the pager's crypt_ops, by which the apple-protect pager
++ * shares one pager among the mappings of a file, so records are never freed:
++ * there is one per image that ever ran, of a few hundred bytes.
++ */
++struct nopac_text {
++	LIST_ENTRY(nopac_text) link;
++	uint64_t fsid;
++	uint64_t fileid;
++	uint64_t size;
++	int64_t  modified;
++	off_t    slice;
++	uint32_t count;
++	struct nopac_range *ranges;     /* sorted, disjoint */
++};
++
++static LIST_HEAD(, nopac_text) nopac_texts[NOPAC_HASH_BUCKETS];
++static LCK_GRP_DECLARE(nopac_lock_group, "nopac");
++static LCK_MTX_DECLARE(nopac_lock, &nopac_lock_group);
++
++/* Counters for the boot log and debugging. */
++uint64_t nopac_text_pages;
++uint64_t nopac_text_words;
++uint32_t nopac_text_images;
++static TUNABLE(bool, nopac_text_enabled, "nopac-text", true);
++static TUNABLE(bool, nopac_text_verbose, "nopac-text-log", false);
++
++static int
++nopac_transform(const void *source, void *destination, unsigned long long offset, void *ops)
++{
++	const struct nopac_text *text = ops;
++	unsigned long long end = offset + NOPAC_CHUNK;
++	uint32_t low = 0, high = text->count;
++	size_t words = 0;
++
++	memcpy(destination, source, NOPAC_CHUNK);
++	/* first range that ends after the chunk starts */
++	while (low < high) {
++		uint32_t middle = low + (high - low) / 2;
++		if (text->ranges[middle].end <= offset) {
++			low = middle + 1;
++		} else {
++			high = middle;
++		}
++	}
++	for (; low < text->count && text->ranges[low].start < end; low++) {
++		uint64_t from = MAX(text->ranges[low].start, offset), to = MIN(text->ranges[low].end, end);
++
++		from = (from + 3) & ~3ull;
++		to &= ~3ull;
++		if (from < to) {
++			words += nopac_rewrite_words((uint32_t *)((uintptr_t)destination + (from - offset)), (to - from) / 4);
++		}
++	}
++	OSIncrementAtomic64((SInt64 *)&nopac_text_pages);
++	if (words) {
++		OSAddAtomic64((SInt64)words, (SInt64 *)&nopac_text_words);
++	}
++	return 0;
++}
++
++static void
++nopac_transform_end(void *ops __unused)
++{
++	/* The record stays for the next mapping of the file. */
++}
++
++static int
++nopac_read(struct vnode *vp, off_t offset, void *buffer, size_t length)
++{
++	int resid = 0;
++	int error = vn_rdwr(UIO_READ, vp, buffer, (int)length, offset, UIO_SYSSPACE, IO_NODELOCKED,
++	    kauth_cred_get(), &resid, current_proc());
++
++	return error ? error : (resid ? EIO : 0);
++}
++
++/* The offset of the arm64e Mach-O that holds `file_start`: 0 in a thin file, the slice of a fat one; -1 if none. */
++static off_t
++nopac_find_slice(struct vnode *vp, off_t file_start, uint64_t file_size)
++{
++	union {
++		struct fat_header header;
++		uint8_t bytes[1024];
++	} head;
++	size_t length = MIN(sizeof(head), file_size);
++	uint32_t magic, count;
++
++	if (length < sizeof(struct mach_header_64) || nopac_read(vp, 0, &head, length) != 0) {
++		return -1;
++	}
++	magic = OSSwapBigToHostInt32(head.header.magic);
++	if (magic != FAT_MAGIC) {
++		return 0;
++	}
++	count = OSSwapBigToHostInt32(head.header.nfat_arch);
++	for (uint32_t i = 0; i < count; i++) {
++		uint64_t offset, size;
++		cpu_type_t type;
++		cpu_subtype_t subtype;
++
++		const struct fat_arch *arch = (const struct fat_arch *)(head.bytes + sizeof(struct fat_header)) + i;
++
++		if ((const uint8_t *)(arch + 1) > head.bytes + length) {
++			break;
++		}
++		type = (cpu_type_t)OSSwapBigToHostInt32((uint32_t)arch->cputype);
++		subtype = (cpu_subtype_t)OSSwapBigToHostInt32((uint32_t)arch->cpusubtype);
++		offset = OSSwapBigToHostInt32(arch->offset);
++		size = OSSwapBigToHostInt32(arch->size);
++		if (type == CPU_TYPE_ARM64 && (subtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E &&
++		    (uint64_t)file_start >= offset && (uint64_t)file_start < offset + size) {
++			return (off_t)offset;
++		}
++	}
++	return -1;
++}
++
++static void
++nopac_sort(struct nopac_range *ranges, uint32_t count)
++{
++	for (uint32_t i = 1; i < count; i++) {
++		struct nopac_range moving = ranges[i];
++		uint32_t at = i;
++
++		for (; at > 0 && ranges[at - 1].start > moving.start; at--) {
++			ranges[at] = ranges[at - 1];
++		}
++		ranges[at] = moving;
++	}
++}
++
++/*
++ * Remove [hole_start, hole_end) from the sorted ranges; returns the new count.
++ * A hole in the middle of a range needs one more slot (capacity is checked).
++ */
++static uint32_t
++nopac_punch(struct nopac_range *ranges, uint32_t count, uint32_t capacity, uint64_t hole_start, uint64_t hole_end)
++{
++	for (uint32_t i = 0; i < count; i++) {
++		struct nopac_range *range = &ranges[i];
++
++		if (hole_end <= range->start || hole_start >= range->end) {
++			continue;
++		}
++		if (hole_start <= range->start && hole_end >= range->end) {
++			memmove(range, range + 1, (count - i - 1) * sizeof(*range));
++			count--;
++			i--;
++		} else if (hole_start <= range->start) {
++			range->start = hole_end;
++		} else if (hole_end >= range->end) {
++			range->end = hole_start;
++		} else if (count < capacity) {
++			memmove(range + 2, range + 1, (count - i - 1) * sizeof(*range));
++			range[1].start = hole_end;
++			range[1].end = range->end;
++			range->end = hole_start;
++			count++;
++			i++;
++		} else {
++			/* no room to split: give up the tail of the range, which the emulator then runs */
++			range->end = hole_start;
++		}
++	}
++	return count;
++}
++
++/* Build the record of the arm64e Mach-O at `slice` of vp; NULL when it is not one or cannot be read. */
++static struct nopac_text *
++nopac_text_create(struct vnode *vp, off_t slice, uint64_t file_size)
++{
++	struct mach_header_64 header;
++	struct nopac_text *text = NULL;
++	struct nopac_range *ranges = NULL;
++	uint8_t *commands = NULL, *holes = NULL;
++	uint32_t sections = 0, count = 0, capacity = 0, holes_size = 0, holes_offset = 0;
++
++	if (nopac_read(vp, slice, &header, sizeof(header)) != 0 ||
++	    header.magic != MH_MAGIC_64 || header.cputype != CPU_TYPE_ARM64 ||
++	    (header.cpusubtype & ~CPU_SUBTYPE_MASK) != CPU_SUBTYPE_ARM64E ||
++	    header.sizeofcmds < sizeof(struct load_command) || header.sizeofcmds > NOPAC_COMMANDS_MAX) {
++		return NULL;
++	}
++	commands = kalloc_data(header.sizeofcmds, Z_WAITOK);
++	if (commands == NULL || nopac_read(vp, slice + (off_t)sizeof(header), commands, header.sizeofcmds) != 0) {
++		goto out;
++	}
++	/* Two passes over the commands: count the code sections, then record them. */
++	for (int pass = 0; pass < 2; pass++) {
++		uint32_t at = 0;
++
++		for (uint32_t i = 0; i < header.ncmds; i++) {
++			const struct load_command *command = (const struct load_command *)(commands + at);
++
++			if (at + sizeof(*command) > header.sizeofcmds || command->cmdsize < sizeof(*command) ||
++			    command->cmdsize > header.sizeofcmds - at) {
++				goto out;
++			}
++			if (command->cmd == LC_SEGMENT_64 && command->cmdsize >= sizeof(struct segment_command_64)) {
++				const struct segment_command_64 *segment = (const struct segment_command_64 *)command;
++				const struct section_64 *section = (const struct section_64 *)(segment + 1);
++
++				if (segment->nsects > (command->cmdsize - sizeof(*segment)) / sizeof(*section)) {
++					goto out;
++				}
++				for (uint32_t s = 0; s < segment->nsects; s++, section++) {
++					uint32_t type = section->flags & SECTION_TYPE;
++
++					if (!(section->flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)) ||
++					    section->offset == 0 || section->size == 0 || type == S_ZEROFILL ||
++					    section->offset > file_size || section->size > file_size - section->offset) {
++						continue;
++					}
++					if (pass == 0) {
++						sections++;
++					} else if (count < sections) {
++						ranges[count].start = (uint64_t)slice + section->offset;
++						ranges[count].end = (uint64_t)slice + section->offset + section->size;
++						count++;
++					}
++				}
++			} else if (command->cmd == LC_DATA_IN_CODE && command->cmdsize >= sizeof(struct linkedit_data_command)) {
++				const struct linkedit_data_command *data = (const struct linkedit_data_command *)command;
++
++				holes_offset = data->dataoff;
++				holes_size = data->datasize;
++			}
++			at += command->cmdsize;
++		}
++		if (pass == 0) {
++			if (sections == 0 || holes_size > NOPAC_COMMANDS_MAX) {
++				goto out;
++			}
++			/* each data-in-code entry can split one range in two */
++			capacity = sections + holes_size / (uint32_t)sizeof(struct data_in_code_entry);
++			ranges = kalloc_data(capacity * sizeof(*ranges), Z_WAITOK | Z_ZERO);
++			if (ranges == NULL) {
++				goto out;
++			}
++		}
++	}
++	nopac_sort(ranges, count);
++	if (holes_size >= sizeof(struct data_in_code_entry)) {
++		holes = kalloc_data(holes_size, Z_WAITOK);
++		if (holes != NULL && nopac_read(vp, slice + holes_offset, holes, holes_size) == 0) {
++			const struct data_in_code_entry *entry = (const struct data_in_code_entry *)holes;
++
++			for (uint32_t i = 0; i < holes_size / sizeof(*entry); i++) {
++				uint64_t start = (uint64_t)slice + entry[i].offset;
++				count = nopac_punch(ranges, count, capacity, start, start + entry[i].length);
++			}
++		}
++	}
++	if (count == 0) {
++		goto out;
++	}
++	text = kalloc_type(struct nopac_text, Z_WAITOK | Z_ZERO);
++	if (text != NULL) {
++		text->slice = slice;
++		text->count = count;
++		text->ranges = ranges;
++		ranges = NULL;
++	}
++out:
++	if (ranges != NULL) {
++		kfree_data(ranges, capacity * sizeof(*ranges));
++	}
++	if (holes != NULL) {
++		kfree_data(holes, holes_size);
++	}
++	if (commands != NULL) {
++		kfree_data(commands, header.sizeofcmds);
++	}
++	return text;
++}
++
++static struct nopac_text *
++nopac_text_find(uint64_t fsid, uint64_t fileid, uint64_t size, int64_t modified, off_t slice)
++{
++	struct nopac_text *text;
++
++	LIST_FOREACH(text, &nopac_texts[fileid % NOPAC_HASH_BUCKETS], link) {
++		if (text->fileid == fileid && text->fsid == fsid && text->size == size &&
++		    text->modified == modified && text->slice == slice) {
++			return text;
++		}
++	}
++	return NULL;
++}
++
++void
++nopac_protect_text(vm_map_t map, vm_map_offset_t start, vm_map_offset_t end, struct vnode *vp, off_t slice, off_t file_start)
++{
++	struct vnode_attr attributes;
++	struct pager_crypt_info crypt_info;
++	struct nopac_text *text, *raced;
++	uint64_t fsid, file_end;
++	kern_return_t kr;
++	bool covered = false;
++
++	if (!nopac_text_enabled || vp == NULL || end <= start) {
++		return;
++	}
++	VATTR_INIT(&attributes);
++	VATTR_WANTED(&attributes, va_fsid);
++	VATTR_WANTED(&attributes, va_fileid);
++	VATTR_WANTED(&attributes, va_data_size);
++	VATTR_WANTED(&attributes, va_modify_time);
++	if (vnode_getattr(vp, &attributes, vfs_context_current()) != 0) {
++		return;
++	}
++	if (slice < 0) {
++		slice = nopac_find_slice(vp, file_start, attributes.va_data_size);
++		if (slice < 0) {
++			return;
++		}
++	}
++	fsid = (uint64_t)attributes.va_fsid;
++
++	lck_mtx_lock(&nopac_lock);
++	text = nopac_text_find(fsid, attributes.va_fileid, attributes.va_data_size, attributes.va_modify_time.tv_sec, slice);
++	lck_mtx_unlock(&nopac_lock);
++	if (text == NULL) {
++		text = nopac_text_create(vp, slice, attributes.va_data_size);
++		if (text == NULL) {
++			return;
++		}
++		text->fsid = fsid;
++		text->fileid = attributes.va_fileid;
++		text->size = attributes.va_data_size;
++		text->modified = attributes.va_modify_time.tv_sec;
++		lck_mtx_lock(&nopac_lock);
++		raced = nopac_text_find(fsid, text->fileid, text->size, text->modified, slice);
++		if (raced == NULL) {
++			LIST_INSERT_HEAD(&nopac_texts[text->fileid % NOPAC_HASH_BUCKETS], text, link);
++			nopac_text_images++;
++		}
++		lck_mtx_unlock(&nopac_lock);
++		if (raced != NULL) {
++			kfree_data(text->ranges, text->count * sizeof(*text->ranges));
++			kfree_type(struct nopac_text, text);
++			text = raced;
++		}
++	}
++
++	/* Nothing to do for a mapping that holds none of the image's code. */
++	file_end = (uint64_t)file_start + (end - start);
++	for (uint32_t i = 0; i < text->count && !covered; i++) {
++		covered = text->ranges[i].start < file_end && text->ranges[i].end > (uint64_t)file_start;
++	}
++	if (!covered) {
++		return;
++	}
++	crypt_info.page_decrypt = nopac_transform;
++	crypt_info.crypt_end = nopac_transform_end;
++	crypt_info.crypt_ops = text;
++	crypt_info.crypt_refcnt = 0;
++	kr = vm_map_apple_protected(map, start, end, (vm_object_offset_t)-1, &crypt_info, CRYPTID_APP_ENCRYPTION);
++	if (kr != KERN_SUCCESS || nopac_text_verbose) {
++		printf("nopac: text 0x%llx-0x%llx file 0x%llx+0x%llx fileid %llu: %u ranges, kr %d\n",
++		    (uint64_t)start, (uint64_t)end, (uint64_t)slice, (uint64_t)file_start - (uint64_t)slice,
++		    text->fileid, text->count, kr);
++	}
++}
++
++#else /* !(NATIVE_PAC_STRIPPED && CONFIG_CODE_DECRYPTION) */
++
++void
++nopac_protect_text(__unused vm_map_t map, __unused vm_map_offset_t start, __unused vm_map_offset_t end,
++    __unused struct vnode *vp, __unused off_t slice, __unused off_t file_start)
++{
++}
++
++#endif /* NATIVE_PAC_STRIPPED && CONFIG_CODE_DECRYPTION */
+diff --git a/bsd/kern/kern_nopac.h b/bsd/kern/kern_nopac.h
+new file mode 100644
+index 0000000..fdf246a
+--- /dev/null
++++ b/bsd/kern/kern_nopac.h
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: BSD-2-Clause-Patent
++/*
++ * User code on a CPU without pointer authentication (NATIVE_PAC_STRIPPED).
++ *
++ * iOS 27 user space is arm64e only. Its code pages are rewritten as they are
++ * paged in: an executable mapping of an arm64e Mach-O is put behind the
++ * apple-protect pager (the mechanism of FairPlay and of protected segments)
++ * with a transform that rewrites the instruction words of the image's code
++ * sections, and only those. The pager validates the code signature of the
++ * page as it is in the file and hands out the rewritten copy with the result,
++ * so signature enforcement and the sealed volumes stay as they are.
++ */
++#ifndef _KERN_NOPAC_H_
++#define _KERN_NOPAC_H_
++
++#include <mach/vm_types.h>
++#include <sys/types.h>
++
++struct vnode;
++
++__BEGIN_DECLS
++/*
++ * [start, end) of `map` maps `vp` executable. If the file is (or, for a fat
++ * file, holds at file offset `file_start`) an arm64e Mach-O, rewrite its code
++ * on page-in. `slice` is the offset of the Mach-O in the file when the caller
++ * knows it, or -1 to find it. Failure leaves the mapping as it was: the trap
++ * emulator then runs whatever is not rewritten.
++ */
++void nopac_protect_text(vm_map_t map, vm_map_offset_t start, vm_map_offset_t end,
++    struct vnode *vp, off_t slice, off_t file_start);
++__END_DECLS
++
++#endif /* _KERN_NOPAC_H_ */
+diff --git a/bsd/kern/mach_loader.c b/bsd/kern/mach_loader.c
+index 18cc33d..a6fb4f4 100644
+--- a/bsd/kern/mach_loader.c
++++ b/bsd/kern/mach_loader.c
+@@ -102,6 +102,7 @@
+ 
+ #if __arm64__
+ #include <arm64/x86_64_compat.h>
++#include <kern/kern_nopac.h>
+ 
+ #if DEVELOPMENT || DEBUG
+ /*
+@@ -2870,6 +2871,12 @@ load_segment(
+ 		ret = LOAD_SUCCESS;
+ 	}
+ 
++	if (LOAD_SUCCESS == ret && (initprot & VM_PROT_EXECUTE) && file_end > file_start) {
++		/* No pointer authentication on this CPU: rewrite the image's code as it is paged in. */
++		nopac_protect_text(map, vm_start, vm_start + (file_end - file_start), vp, pager_offset,
++		    pager_offset + (off_t)file_start);
++	}
++
+ 	if (LOAD_SUCCESS == ret &&
+ 	    filetype == MH_DYLINKER &&
+ 	    result->all_image_info_addr == MACH_VM_MIN_ADDRESS) {
+diff --git a/osfmk/arm64/nopac_rewrite.c b/osfmk/arm64/nopac_rewrite.c
+new file mode 100644
+index 0000000..6596d93
+--- /dev/null
++++ b/osfmk/arm64/nopac_rewrite.c
+@@ -0,0 +1,105 @@
++// SPDX-License-Identifier: MIT
++/*
++ * See nopac_rewrite.h. Pointers are never signed on a CPU without pointer
++ * authentication, so PAC*, AUT* and XPAC* become NOP, the authenticated
++ * branches and loads become their plain forms, and PACGA becomes a
++ * deterministic EOR. Forms with no 4-byte replacement (LDRAA/LDRAB outside the
++ * LDR/LDUR offset range, FJCVTZS) are left for the trap emulator
++ * (nopac_emulate.c).
++ */
++#include <arm64/nopac_rewrite.h>
++
++#define NOP             0xD503201Fu
++#define RET             0xD65F03C0u
++#define ERET            0xD69F03E0u
++#define BR              0xD61F0000u
++#define BLR             0xD63F0000u
++#define LDR_UNSIGNED    0xF9400000u
++#define LDUR            0xF8400000u
++#define LDR_PRE_INDEX   0xF8400C00u
++#define EOR_ROR_13      (0xCAC00000u | 13u << 10)
++
++static inline uint32_t
++rewrite_load(uint32_t word)
++{
++	int32_t raw = (int32_t)((word >> 22 & 1) << 9 | (word >> 12 & 0x1FF));
++	int32_t offset = ((raw & 0x200) ? raw - 0x400 : raw) * 8;
++	uint32_t registers = word & 0x3FF;
++	uint32_t imm9 = (uint32_t)offset & 0x1FF;
++
++	if (word >> 11 & 1) {
++		return (offset < -256 || offset > 255) ? word : (LDR_PRE_INDEX | imm9 << 12 | registers);
++	}
++	if (offset >= 0) {
++		return LDR_UNSIGNED | (uint32_t)(offset >> 3) << 10 | registers;
++	}
++	return offset >= -256 ? (LDUR | imm9 << 12 | registers) : word;
++}
++
++static inline uint32_t
++rewrite_word(uint32_t word)
++{
++	/*
++	 * Every form handled here has one of these top bytes; most instructions
++	 * of a page leave after this test.
++	 */
++	switch (word >> 24) {
++	case 0xD6:
++		if ((word & 0xFFFFFBFFu) == 0xD65F0BFFu) {              /* RETAA, RETAB */
++			return RET;
++		}
++		if ((word & 0xFFFFFBFFu) == 0xD69F0BFFu) {              /* ERETAA, ERETAB */
++			return ERET;
++		}
++		if ((word & 0xFFFFF81Fu) == 0xD61F081Fu) {              /* BRAAZ, BRABZ */
++			return BR | (word & 0x3E0);
++		}
++		if ((word & 0xFFFFF81Fu) == 0xD63F081Fu) {              /* BLRAAZ, BLRABZ */
++			return BLR | (word & 0x3E0);
++		}
++		return word;
++	case 0xD7:
++		if ((word & 0xFFFFF800u) == 0xD71F0800u) {              /* BRAA, BRAB */
++			return BR | (word & 0x3E0);
++		}
++		if ((word & 0xFFFFF800u) == 0xD73F0800u) {              /* BLRAA, BLRAB */
++			return BLR | (word & 0x3E0);
++		}
++		return word;
++	case 0xDA:
++		if ((word & 0xFFFF0000u) == 0xDAC10000u) {              /* PAC*, AUT*, XPAC* */
++			uint32_t opcode = word >> 10 & 0x3F;
++			if (opcode <= 0x11 && (opcode < 0x08 || (word >> 5 & 0x1F) == 31)) {
++				return NOP;
++			}
++		}
++		return word;
++	case 0x9A:
++		if ((word & 0xFFE0FC00u) == 0x9AC03000u) {              /* PACGA */
++			return EOR_ROR_13 | (word & 0x001F03FFu);
++		}
++		return word;
++	case 0xF8:
++		if ((word & 0xFF200400u) == 0xF8200400u) {              /* LDRAA, LDRAB */
++			return rewrite_load(word);
++		}
++		return word;
++	default:
++		return word;
++	}
++}
++
++size_t
++nopac_rewrite_words(uint32_t *words, size_t count)
++{
++	size_t changed = 0;
++
++	for (size_t i = 0; i < count; i++) {
++		uint32_t word = words[i], replacement = rewrite_word(word);
++		if (replacement != word) {
++			words[i] = replacement;
++			changed++;
++		}
++	}
++	return changed;
++}
+diff --git a/osfmk/arm64/nopac_rewrite.h b/osfmk/arm64/nopac_rewrite.h
+new file mode 100644
+index 0000000..a47ab68
+--- /dev/null
++++ b/osfmk/arm64/nopac_rewrite.h
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: MIT
++/*
++ * Rewrite arm64e instructions for a CPU without pointer authentication.
++ * From darwin-lisa (https://github.com/mateusseiboth/darwin-lisa, kernel/pacstrip/pac_rewrite.c),
++ * Copyright (c) 2026 Mateus Seiboth. Same table and results as package/pacstrip/insn.py of the
++ * device repository, which rewrites the kernel image; this copy rewrites user code pages.
++ */
++#ifndef _ARM64_NOPAC_REWRITE_H_
++#define _ARM64_NOPAC_REWRITE_H_
++
++#include <stddef.h>
++#include <stdint.h>
++
++/* Rewrites `count` instruction words in place; returns how many changed. */
++size_t nopac_rewrite_words(uint32_t *words, size_t count);
++
++#endif /* _ARM64_NOPAC_REWRITE_H_ */
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index 9259fea..9f078c8 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -8,6 +8,7 @@ osfmk/vm/vm_apple_protect.c	 standard
+ osfmk/arm64/hi_res_clock_map.c 	optional hi_res_clock
+ osfmk/arm64/bootlog.c			standard
+ osfmk/arm64/nopac_emulate.c		standard
++osfmk/arm64/nopac_rewrite.c		standard
+ 
+ osfmk/arm/pmap/pmap.c			optional nos_arm_pmap
+ osfmk/arm/pmap/pmap_cs.c		optional nos_arm_pmap

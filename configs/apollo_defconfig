@@ -1,9 +1,17 @@
 # Kernel configuration: CONFIG_XNU_<NAME> becomes XNU_<NAME> for the kernel build script.
 # Applied after arch:configs/common.config, soc:configs/sm8250.config and os:configs/ios.config.
+# The values follow UniXNU-sheng's sheng_ipados27_defconfig, the reference iPadOS 27 port; what that board adds for
+# its own storage, display and GPU stays out until apollo has the matching components.
+CONFIG_XNU_BUILD_ARCHIVES=y
 CONFIG_XNU_ARM_DT_PLATFORM=y
 CONFIG_XNU_ARMCPU=y
-CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
-# Storage: HakiOS runs from RAM on apollo; UFS is not ported yet.
+CONFIG_XNU_CRYPTO_BOOTSTRAP="source"
+CONFIG_XNU_DT_PANIC_REGION=y
+CONFIG_XNU_ARMVIRT_PLATFORM=n
+# The native kernel replaces com.apple.kernel inside the 24A446 kernel collection: chained fixups and split-segment
+# records are what the prelink emitter relocates it by.
+CONFIG_XNU_KERNEL_CHAINED_FIXUPS=y
+# Storage: no UFS component for apollo yet (porting.toml, area "storage").
 # CONFIG_XNU_NATIVE_UFS is not set
 # GPU: the A650 driver is HakiOS's (patches/xnu/0001), not the catalog's Adreno740.
 # CONFIG_XNU_NATIVE_ADRENO is not set
